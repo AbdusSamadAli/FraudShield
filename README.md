@@ -110,8 +110,7 @@ Requirements: Docker (Docker Desktop or Docker Engine) with about 6 GB of RAM al
 Create a `.env` file with your own local passwords. It is git-ignored and never committed:
 
 ```bash
-echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)" > .env
-echo "GRAFANA_ADMIN_PASSWORD=$(openssl rand -hex 12)" >> .env
+for key in POSTGRES_PASSWORD GF_SECURITY_ADMIN_PASSWORD; do echo "$key"="$(openssl rand -hex 16)"; done > .env
 docker compose up --build -d
 ```
 
@@ -151,7 +150,7 @@ docker compose restart ml-scorer
 
 ## Configuration
 
-`POSTGRES_PASSWORD` and `GRAFANA_ADMIN_PASSWORD` are required and have no defaults, so no credentials live in the repository. Everything else has a working default. Set values in the git-ignored `.env` file next to `docker-compose.yml`.
+`POSTGRES_PASSWORD` and `GF_SECURITY_ADMIN_PASSWORD` are required and exist only in `.env`. Containers load that file with `env_file`, so no credentials appear anywhere in the repository. Everything else has a working default. Set values in the git-ignored `.env` file next to `docker-compose.yml`.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -163,7 +162,7 @@ docker compose restart ml-scorer
 | `SIM_FRAUD_RATE` | 0.02 | Background fraud rate |
 | `MAX_RETRIES` / `RETRY_BACKOFF_SECONDS` | 3 / 1.0 | Retry policy before DLQ |
 | `FEATURE_ENGINE_REPLICAS` | 2 | Feature engine instances |
-| `GRAFANA_ADMIN_PASSWORD` | required | Grafana admin password |
+| `GF_SECURITY_ADMIN_PASSWORD` | required | Grafana admin password |
 | `GRAFANA_ADMIN_USER` | admin | Grafana admin user |
 | `LOG_LEVEL` | INFO | Service log level |
 

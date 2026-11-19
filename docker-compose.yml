@@ -6,10 +6,13 @@ x-python-service: &python-service
     context: .
     dockerfile: docker/python.Dockerfile
   restart: unless-stopped
+  env_file: .env
   environment: &python-env
     KAFKA_BOOTSTRAP_SERVERS: kafka:29092
     SCHEMA_REGISTRY_URL: http://schema-registry:8081
-    DATABASE_URL: postgresql://${POSTGRES_USER:-fraud}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-fraudshield}
+    POSTGRES_HOST: postgres
+    POSTGRES_USER: ${POSTGRES_USER:-fraud}
+    POSTGRES_DB: ${POSTGRES_DB:-fraudshield}
     REDIS_URL: redis://redis:6379/0
     PAYMENT_API_URL: http://payment-api:8000
     MODEL_DIR: /models
@@ -81,9 +84,9 @@ services:
     image: postgres:16-alpine
     ports:
       - "5432:5432"
+    env_file: .env
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-fraud}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-fraudshield}
     volumes:
       - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
@@ -240,9 +243,9 @@ services:
     image: grafana/grafana:11.3.1
     ports:
       - "3001:3000"
+    env_file: .env
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/fraudshield.json
