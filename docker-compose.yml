@@ -1,0 +1,259 @@
+name: fraudshield
+
+x-python-service: &python-service
+  image: fraudshield/python:latest
+  build:
+    context: .
+    dockerfile: docker/python.Dockerfile
+  restart: unless-stopped
+  environment: &python-env
+    KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    DATABASE_URL: postgresql://${POSTGRES_USER:-fraud}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-fraudshield}
+    REDIS_URL: redis://redis:6379/0
+    PAYMENT_API_URL: http://payment-api:8000
+    MODEL_DIR: /models
+    REVIEW_THRESHOLD: ${REVIEW_THRESHOLD:-0.5}
+    BLOCK_THRESHOLD: ${BLOCK_THRESHOLD:-0.8}
+    SIM_TPS: ${SIM_TPS:-20}
+    SIM_USERS: ${SIM_USERS:-100000}
+    SIM_FRAUD_RATE: ${SIM_FRAUD_RATE:-0.02}
+    MAX_RETRIES: ${MAX_RETRIES:-3}
+    RETRY_BACKOFF_SECONDS: ${RETRY_BACKOFF_SECONDS:-1.0}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+x-kafka-ready: &kafka-ready
+  topic-init:
+    condition: service_completed_successfully
+  schema-registry:
+    condition: service_healthy
+
+services:
+  kafka:
+    image: confluentinc/cp-kafka:7.7.1
+    hostname: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_RETENTION_HOURS: 168
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:29092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.7.1
+    hostname: schema-registry
+    ports:
+      - "8081:8081"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/subjects > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fraud}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-fraudshield}
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fraud} -d ${POSTGRES_DB:-fraudshield}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  topic-init:
+    <<: *python-service
+    restart: "no"
+    command: ["python", "-m", "common.admin"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  trainer:
+    <<: *python-service
+    restart: "no"
+    command: ["python", "-m", "ml.train", "--out", "/models", "--if-missing"]
+    volumes:
+      - models:/models
+
+  payment-api:
+    <<: *python-service
+    command: ["uvicorn", "services.payment_api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health > /dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  outbox-relay:
+    <<: *python-service
+    command: ["python", "-m", "services.outbox_relay.main"]
+    depends_on:
+      <<: *kafka-ready
+      postgres:
+        condition: service_healthy
+
+  feature-engine:
+    <<: *python-service
+    command: ["python", "-m", "services.feature_engine.main"]
+    deploy:
+      replicas: ${FEATURE_ENGINE_REPLICAS:-2}
+    depends_on:
+      <<: *kafka-ready
+      redis:
+        condition: service_healthy
+
+  ml-scorer:
+    <<: *python-service
+    command: ["python", "-m", "services.ml_scorer.main"]
+    volumes:
+      - models:/models:ro
+    depends_on:
+      <<: *kafka-ready
+      trainer:
+        condition: service_completed_successfully
+
+  decision-service:
+    <<: *python-service
+    command: ["python", "-m", "services.decision_service.main"]
+    depends_on:
+      <<: *kafka-ready
+      postgres:
+        condition: service_healthy
+
+  dashboard-api:
+    <<: *python-service
+    command: ["uvicorn", "services.dashboard_api.main:app", "--host", "0.0.0.0", "--port", "8001"]
+    ports:
+      - "8001:8001"
+    volumes:
+      - models:/models:ro
+    depends_on:
+      <<: *kafka-ready
+      postgres:
+        condition: service_healthy
+      trainer:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8001/api/health > /dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  simulator:
+    <<: *python-service
+    command: ["python", "-m", "services.simulator.main"]
+    depends_on:
+      <<: *kafka-ready
+      payment-api:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      dashboard-api:
+        condition: service_healthy
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    ports:
+      - "8080:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: fraudshield
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.8.0
+    command: ["--kafka.server=kafka:29092"]
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/fraudshield.json
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  kafka-data:
+  postgres-data:
+  redis-data:
+  models:

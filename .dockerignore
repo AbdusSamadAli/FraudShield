@@ -1,0 +1,10 @@
+**/__pycache__
+**/*.pyc
+.venv
+venv
+.env
+.git
+ml/artifacts
+frontend/node_modules
+frontend/dist
+.pytest_cache
